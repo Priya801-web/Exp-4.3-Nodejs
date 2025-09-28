@@ -1,0 +1,164 @@
+// booking-server.js
+const express = require('express');
+const crypto = require('crypto');
+
+const app = express();
+app.use(express.json());
+
+/**
+ * SeatManager
+ * - seats: Map seatId -> { status: 'available'|'locked'|'booked', lockToken?, lockOwner?, lockExpiryTimeout? }
+ * - queues: Map seatId -> array of waiting resolvers to ensure fairness if needed
+ */
+class SeatManager {
+  constructor(seatIds = [], defaultLockTTLms = 60000) {
+    this.seats = new Map();
+    this.queues = new Map();
+    this.defaultLockTTLms = defaultLockTTLms;
+    for (const id of seatIds) {
+      this.seats.set(id, { status: 'available', lockToken: null, lockOwner: null, lockTimeout: null });
+      this.queues.set(id, []);
+    }
+  }
+
+  _generateToken() {
+    return crypto.randomBytes(16).toString('hex');
+  }
+
+  getSeatState() {
+    const out = {};
+    for (const [id, info] of this.seats) {
+      out[id] = {
+        status: info.status,
+        lockOwner: info.lockOwner || null,
+        lockToken: info.lockToken ? '***hidden***' : null,
+      };
+    }
+    return out;
+  }
+
+  async reserveSeat(seatId, ownerId, ttlMs = null) {
+    if (!this.seats.has(seatId)) throw new Error('Invalid seatId');
+
+    const seat = this.seats.get(seatId);
+    ttlMs = ttlMs ?? this.defaultLockTTLms;
+
+    // If available: lock immediately
+    if (seat.status === 'available') {
+      const token = this._generateToken();
+      seat.status = 'locked';
+      seat.lockToken = token;
+      seat.lockOwner = ownerId;
+
+      // set TTL to auto release
+      seat.lockTimeout = setTimeout(() => {
+        // only auto-release if still locked with same token
+        if (seat.status === 'locked') {
+          seat.status = 'available';
+          seat.lockToken = null;
+          seat.lockOwner = null;
+          seat.lockTimeout = null;
+        }
+      }, ttlMs);
+
+      return { success: true, token, expiresInMs: ttlMs };
+    }
+
+    // If locked or booked, return failure
+    return { success: false, reason: seat.status === 'booked' ? 'Already booked' : 'Locked' };
+  }
+
+  confirmBooking(seatId, token, ownerId) {
+    if (!this.seats.has(seatId)) throw new Error('Invalid seatId');
+    const seat = this.seats.get(seatId);
+
+    if (seat.status !== 'locked') return { success: false, reason: 'Not locked' };
+    if (seat.lockToken !== token) return { success: false, reason: 'Invalid token' };
+    if (seat.lockOwner !== ownerId) return { success: false, reason: 'Not lock owner' };
+
+    // finalize booking
+    clearTimeout(seat.lockTimeout);
+    seat.lockTimeout = null;
+    seat.status = 'booked';
+    seat.lockToken = null;
+    seat.lockOwner = ownerId;
+    return { success: true };
+  }
+
+  releaseLock(seatId, token, ownerId) {
+    if (!this.seats.has(seatId)) throw new Error('Invalid seatId');
+    const seat = this.seats.get(seatId);
+
+    if (seat.status !== 'locked') return { success: false, reason: 'Not locked' };
+    if (seat.lockToken !== token) return { success: false, reason: 'Invalid token' };
+    if (seat.lockOwner !== ownerId) return { success: false, reason: 'Not lock owner' };
+
+    clearTimeout(seat.lockTimeout);
+    seat.lockTimeout = null;
+    seat.status = 'available';
+    seat.lockToken = null;
+    seat.lockOwner = null;
+    return { success: true };
+  }
+}
+
+// initialize manager with 10 seats: S1..S10
+const seatIds = Array.from({ length: 10 }, (_, i) => `S${i + 1}`);
+const seatManager = new SeatManager(seatIds, 60000); // 60s locks
+
+// routes
+
+// 1. List seats and status
+app.get('/seats', (req, res) => {
+  res.json({ seats: seatManager.getSeatState() });
+});
+
+// 2. Reserve (lock) a seat
+// body: { seatId, ownerId, ttlMs (optional) }
+app.post('/reserve', (req, res) => {
+  const { seatId, ownerId, ttlMs } = req.body;
+  if (!seatId || !ownerId) return res.status(400).json({ error: 'seatId and ownerId required' });
+
+  try {
+    const result = seatManager.reserveSeat(seatId, ownerId, ttlMs);
+    // reserveSeat is synchronous-ish (returns immediate result). Keep it consistent.
+    if (result.success) return res.json(result);
+    return res.status(409).json(result); // conflict
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+// 3. Confirm booking (finalize)
+// body: { seatId, ownerId, token }
+app.post('/confirm', (req, res) => {
+  const { seatId, ownerId, token } = req.body;
+  if (!seatId || !ownerId || !token) return res.status(400).json({ error: 'seatId, ownerId and token required' });
+  try {
+    const r = seatManager.confirmBooking(seatId, token, ownerId);
+    if (r.success) return res.json(r);
+    return res.status(409).json(r);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+// 4. Release an existing lock voluntarily
+// body: { seatId, ownerId, token }
+app.post('/release', (req, res) => {
+  const { seatId, ownerId, token } = req.body;
+  if (!seatId || !ownerId || !token) return res.status(400).json({ error: 'seatId, ownerId and token required' });
+  try {
+    const r = seatManager.releaseLock(seatId, token, ownerId);
+    if (r.success) return res.json(r);
+    return res.status(409).json(r);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+// simple health
+app.get('/', (req, res) => res.send('Ticket Booking Server running'));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server listening on http://localhost:${PORT}`));
